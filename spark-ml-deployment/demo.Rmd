@@ -1,0 +1,123 @@
+---
+title: "sparklyr model deployment demo"
+output: html_notebook
+---
+
+# Building the model
+
+We'll start by loading the necessary packages.
+
+```{r, message = FALSE}
+library(sparklyr)
+library(dplyr)
+library(mleap)
+```
+
+Then we'll make a connection to the Spark cluster.
+
+```{r}
+conf <- spark_config()
+conf$`sparklyr.cores.local` <- 4
+conf$`sparklyr.shell.driver-memory` <- "8G"
+sc <- spark_connect(master = "local", version = "2.3.0", config = conf)
+```
+
+We'll work with the NYC flights dataset from the **nycflights13** package.
+
+```{r}
+flights_tbl <- copy_to(sc, nycflights13::flights)
+
+data <- flights_tbl %>%
+  filter(!is.na(arr_delay)) %>%
+  mutate(dep_delay = ifelse(is.na(dep_delay), 0, dep_delay))
+
+glimpse(data)
+```
+
+We'll build a model that predicts the arrival delay variable, `arr_delay`.
+
+Let's define a pipeline that includes feature engineering steps:
+
+```{r}
+data_prep_step <- ml_pipeline(sc) %>%
+  ft_feature_hasher(
+    c("origin", "dest"), "airports",
+    num_features = 64) %>%
+  ft_vector_assembler(
+    c("dep_delay", "airports"), "features"
+  ) 
+
+pipeline <- data_prep_step %>%
+  ml_random_forest_regressor(label_col = "arr_delay")
+
+pipeline
+```
+
+Perform a hyperparameter grid search
+
+```{r}
+param_grid <- list(
+  random_forest = list(
+    subsampling_rate = c(0.7, 1),
+    max_depth = c(1, 5)
+  )
+)
+
+cv <- ml_cross_validator(
+  sc, pipeline, param_grid,
+  evaluator = ml_regression_evaluator(sc, label_col = "arr_delay"),
+  num_folds = 3L
+)
+
+cv_model <- cv %>%
+  ml_fit(data)
+```
+
+Look at the results
+
+```{r}
+ml_validation_metrics(cv_model)
+```
+
+Train the model with the best hyperparameters on all of the data:
+
+```{r}
+pipeline <- data_prep_step %>%
+  ml_random_forest_regressor(
+    subsampling_rate = 1, max_depth = 5,
+    label_col = "arr_delay")
+
+pipeline_model <- pipeline %>%
+  ml_fit(data)
+```
+
+Persist the model to disk
+
+```{r}
+ml_save(pipeline_model, "saved_models/spark-pipeline")
+
+ml_write_bundle(pipeline_model, 
+                ml_transform(pipeline_model, data),
+                "saved_models/mleap-bundle.zip")
+```
+
+# Serving the model
+
+*Note that in the following snippets, we're utilizing a workflow provided for testing only --- i.e. they allow you prototype user-facing features in R, but for production the saved models should be embedded in more performant frameworks.*
+
+Serve the model using the Spark ML persistence API:
+
+```{r}
+p <- plumber::plumb("plumber/spark-plumber.R")
+p$run()
+```
+
+We can then POST something like `{"origin":["ORD"],"dest":["SFO"],"dep_delay":[10]} ` to the endpoint.
+
+Now let's try serving the MLeap model:
+
+```{r}
+p <- plumber::plumb("plumber/mleap-plumber.R")
+p$run()
+```
+
